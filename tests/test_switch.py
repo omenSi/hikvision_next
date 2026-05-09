@@ -67,6 +67,36 @@ async def test_event_switch_state_of_a_camera(
 
 
 @pytest.mark.parametrize("init_integration", ["DS-7608NXI-I2"], indirect=True)
+async def test_motion_detection_switch_does_not_overwrite_detection_area(
+    hass: HomeAssistant, init_integration: MockConfigEntry
+) -> None:
+    """Test that toggling motion detection does not include MotionDetectionLayout in payload."""
+
+    entity_id = "switch.ds_7608nxi_i0_0p_s0000000000ccrrj00000000wcvu_2_motiondetection"
+    assert (switch := hass.states.get(entity_id))
+    assert switch.state == STATE_OFF
+
+    def check_no_detection_layout(request, route):
+        payload = request.content.decode("utf-8")
+        if "MotionDetectionLayout" in payload:
+            raise AssertionError("PUT payload must not contain MotionDetectionLayout")
+        if "<enabled>true</enabled>" not in payload:
+            raise AssertionError("PUT payload must contain enabled=true")
+        return httpx.Response(200)
+
+    url = f"{TEST_HOST}/ISAPI/ContentMgmt/InputProxy/channels/2/video/motionDetection"
+    endpoint = respx.put(url).mock(side_effect=check_no_detection_layout)
+
+    await hass.services.async_call(
+        SWITCH_DOMAIN,
+        SERVICE_TURN_ON,
+        {ATTR_ENTITY_ID: entity_id},
+        blocking=True,
+    )
+    assert endpoint.called
+
+
+@pytest.mark.parametrize("init_integration", ["DS-7608NXI-I2"], indirect=True)
 async def test_event_switch_payload(hass: HomeAssistant, init_integration: MockConfigEntry) -> None:
     """Test event switch."""
 

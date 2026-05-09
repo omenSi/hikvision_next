@@ -525,6 +525,9 @@ class ISAPIClient:
             if new_state == data[node]["enabled"]:
                 return
             data[node]["enabled"] = new_state
+            # Remove detection area sub-nodes to avoid overwriting user-configured
+            # detection regions when only toggling enabled state
+            data[node].pop("MotionDetectionLayout", None)
             xml = xmltodict.unparse(data)
             await self.request(PUT, event.url, present="xml", data=xml)
         else:
