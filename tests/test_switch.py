@@ -70,7 +70,13 @@ async def test_event_switch_state_of_a_camera(
 async def test_motion_detection_switch_does_not_overwrite_detection_area(
     hass: HomeAssistant, init_integration: MockConfigEntry
 ) -> None:
-    """Test that toggling motion detection does not include MotionDetectionLayout in payload."""
+    """Test that toggling motion detection preserves the user's drawn area.
+
+    The PUT payload must keep MotionDetectionLayout (some firmware requires it,
+    returning 400 otherwise) and the user's gridMap, but strip RegionList so the
+    device does not recompute gridMap from the bounding-box rectangle stored in
+    RegionCoordinatesList.
+    """
 
     entity_id = "switch.ds_7608nxi_i0_0p_s0000000000ccrrj00000000wcvu_2_motiondetection"
     assert (switch := hass.states.get(entity_id))
@@ -78,8 +84,12 @@ async def test_motion_detection_switch_does_not_overwrite_detection_area(
 
     def check_no_detection_layout(request, route):
         payload = request.content.decode("utf-8")
-        if "MotionDetectionLayout" in payload:
-            raise AssertionError("PUT payload must not contain MotionDetectionLayout")
+        if "RegionList" in payload or "RegionCoordinates" in payload:
+            raise AssertionError("PUT payload must not contain polygon coordinates")
+        if "MotionDetectionLayout" not in payload:
+            raise AssertionError("PUT payload must contain MotionDetectionLayout")
+        if "<gridMap>" not in payload:
+            raise AssertionError("PUT payload must contain gridMap")
         if "<enabled>true</enabled>" not in payload:
             raise AssertionError("PUT payload must contain enabled=true")
         return httpx.Response(200)
