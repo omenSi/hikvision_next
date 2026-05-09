@@ -67,35 +67,38 @@ async def test_event_switch_state_of_a_camera(
 
 
 @pytest.mark.parametrize("init_integration", ["DS-7608NXI-I2"], indirect=True)
-async def test_motion_detection_switch_does_not_overwrite_detection_area(
+async def test_motion_detection_switch_preserves_polygon(
     hass: HomeAssistant, init_integration: MockConfigEntry
 ) -> None:
-    """Test that toggling motion detection preserves the user's drawn area.
+    """Test that toggling motion detection preserves the user's drawn polygon.
 
-    The PUT payload must keep MotionDetectionLayout (some firmware requires it,
-    returning 400 otherwise) and the user's gridMap, but strip RegionList so the
-    device does not recompute gridMap from the bounding-box rectangle stored in
-    RegionCoordinatesList.
+    When regionType is "grid" the firmware recomputes RegionCoordinatesList as
+    the bounding box of gridMap on every PUT, destroying the user's polygon.
+    The Hikvision web UI works around this by sending regionType="region" with
+    a zeroed gridMap, which makes the firmware treat RegionList as the source
+    of truth. The integration must mirror that payload.
     """
 
     entity_id = "switch.ds_7608nxi_i0_0p_s0000000000ccrrj00000000wcvu_2_motiondetection"
     assert (switch := hass.states.get(entity_id))
     assert switch.state == STATE_OFF
 
-    def check_no_detection_layout(request, route):
+    def check_payload(request, route):
         payload = request.content.decode("utf-8")
-        if "RegionList" in payload or "RegionCoordinates" in payload:
-            raise AssertionError("PUT payload must not contain polygon coordinates")
-        if "MotionDetectionLayout" not in payload:
-            raise AssertionError("PUT payload must contain MotionDetectionLayout")
-        if "<gridMap>" not in payload:
-            raise AssertionError("PUT payload must contain gridMap")
+        if "<regionType>region</regionType>" not in payload:
+            raise AssertionError("PUT payload must use regionType=region")
+        if "<regionType>grid</regionType>" in payload:
+            raise AssertionError("PUT payload must not use regionType=grid")
+        if "<gridMap>0" not in payload or any(c not in "0" for c in payload.split("<gridMap>")[1].split("</gridMap>")[0]):
+            raise AssertionError("PUT payload must contain a zeroed gridMap")
+        if "RegionCoordinates" not in payload:
+            raise AssertionError("PUT payload must contain RegionCoordinates")
         if "<enabled>true</enabled>" not in payload:
             raise AssertionError("PUT payload must contain enabled=true")
         return httpx.Response(200)
 
     url = f"{TEST_HOST}/ISAPI/ContentMgmt/InputProxy/channels/2/video/motionDetection"
-    endpoint = respx.put(url).mock(side_effect=check_no_detection_layout)
+    endpoint = respx.put(url).mock(side_effect=check_payload)
 
     await hass.services.async_call(
         SWITCH_DOMAIN,
