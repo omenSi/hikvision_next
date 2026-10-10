@@ -21,6 +21,7 @@ from .const import (
     EVENT_BASIC,
     EVENT_IO,
     EVENT_PIR,
+    EVENT_THERMAL,
     EVENTS,
     EVENTS_ALTERNATE_ID,
     GET,
@@ -43,6 +44,15 @@ from .models import (
     StorageInfo,
 )
 from .utils import bool_to_str, deep_get, parse_isapi_response, str_to_bool
+
+# Helper to sanitize channel IDs (e.g. converting "I-1" to 1)
+def clean_int(value):
+    """Sanitize and convert value to int, handling alphanumeric strings."""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        # Extract digits from string (e.g. "I-1" -> "1")
+        return int("".join(filter(str.isdigit, str(value))))
 
 Node = dict[str, Any]
 
@@ -81,6 +91,7 @@ class ISAPIClient:
         self.storage: list[StorageInfo] = []
         self.protocols = ProtocolsInfo()
         self.pending_initialization = False
+        self._forbidden_cache: set[str] = set()
 
     async def get_device_info(self):
         """Get device info."""
@@ -179,7 +190,7 @@ class ISAPIClient:
                     serial_no = source.get("serialNumber")
                     if not serial_no or self.get_camera_by_serial_no(serial_no):
                         # serial no is not always recognized correcly by NVR
-                        serial_no = f"{self.device_info.serial_no}_{source.get("proxyProtocol")}_{camera_id}"
+                        serial_no = f"{self.device_info.serial_no}_{source.get('proxyProtocol')}_{camera_id}"
 
                     self.cameras.append(
                         IPCamera(
@@ -205,16 +216,17 @@ class ISAPIClient:
                 )
 
                 for analog_camera in analog_cameras:
-                    camera_id = analog_camera.get("id")
+                    camera_id = clean_int(analog_camera.get("id"))
                     device_serial_no = f"{self.device_info.serial_no}-VI{camera_id}"
+                    input_port = clean_int(analog_camera.get("inputPort"))
 
                     self.cameras.append(
                         AnalogCamera(
-                            id=int(camera_id),
+                            id=camera_id,
                             name=analog_camera.get("name"),
                             model=analog_camera.get("resDesc"),
                             serial_no=device_serial_no,
-                            input_port=int(analog_camera.get("inputPort")),
+                            input_port=input_port,
                             connection_type=CONNECTION_TYPE_DIRECT,
                             streams=await self.get_camera_streams(camera_id),
                         )
@@ -245,10 +257,47 @@ class ISAPIClient:
             event_type = event_trigger.get("eventType")
             if not event_type:
                 return None
-            event_id = event_type.lower()
-            # Translate to alternate IDs
-            if event_id in EVENTS_ALTERNATE_ID:
-                event_id = EVENTS_ALTERNATE_ID[event_id]
+
+            raw_event_types = event_type if isinstance(event_type, list) else [event_type]
+            event_types: list[str] = []
+            for raw_event_type in raw_event_types:
+                if isinstance(raw_event_type, dict):
+                    raw_event_type = raw_event_type.get("#text")
+                if raw_event_type:
+                    event_types.append(str(raw_event_type))
+
+            if not event_types:
+                return None
+
+            event_id = None
+            for candidate in event_types:
+                if candidate in EVENTS_ALTERNATE_ID:
+                    normalized = EVENTS_ALTERNATE_ID[candidate]
+                else:
+                    normalized = candidate.lower()
+                    if normalized not in EVENTS and "-" in normalized:
+                        prefix = normalized.split("-", 1)[0]
+                        if prefix in EVENTS_ALTERNATE_ID:
+                            normalized = EVENTS_ALTERNATE_ID[prefix]
+                        elif prefix in EVENTS:
+                            normalized = prefix
+                    if normalized in EVENTS_ALTERNATE_ID:
+                        normalized = EVENTS_ALTERNATE_ID[normalized]
+
+                if normalized in EVENTS:
+                    event_id = normalized
+                    break
+
+            if event_id is None:
+                event_id = event_types[0].lower()
+                if event_id not in EVENTS and "-" in event_id:
+                    prefix = event_id.split("-", 1)[0]
+                    if prefix in EVENTS_ALTERNATE_ID:
+                        event_id = EVENTS_ALTERNATE_ID[prefix]
+                    elif prefix in EVENTS:
+                        event_id = prefix
+                if event_id in EVENTS_ALTERNATE_ID:
+                    event_id = EVENTS_ALTERNATE_ID[event_id]
 
             if event_id == EVENT_PIR:
                 is_supported = str_to_bool(deep_get(system_capabilities, "WLAlarmCap.isSupportPIR", False))
@@ -260,15 +309,24 @@ class ISAPIClient:
             is_proxy = False
 
             if event_id == EVENT_IO:
-                io_port = int(event_trigger.get("inputIOPortID", 0))
+                io_port = clean_int(event_trigger.get("inputIOPortID", 0))
                 if not io_port:
-                    io_port = int(event_trigger.get("dynInputIOPortID", 0))
+                    io_port = clean_int(event_trigger.get("dynInputIOPortID", 0))
                     is_proxy = io_port > 0
             else:
-                channel_id = int(event_trigger.get("videoInputChannelID", 0))
+                channel_id = clean_int(event_trigger.get("videoInputChannelID", 0))
                 if not channel_id:
-                    channel_id = int(event_trigger.get("dynVideoInputChannelID", 0))
+                    channel_id = clean_int(event_trigger.get("dynVideoInputChannelID", 0))
                     is_proxy = channel_id > 0
+                # Fallback: Extract channel from event ID (e.g., "VMD-1" → 1)
+                # Some firmware versions don't include videoInputChannelID for all events
+                if not channel_id:
+                    event_id_raw = event_trigger.get("id")
+                    if isinstance(event_id_raw, list):
+                        event_id_raw = event_id_raw[0] if event_id_raw else None
+                    if event_id_raw and "-" in str(event_id_raw):
+                        with suppress(ValueError, IndexError):
+                            channel_id = int(str(event_id_raw).rsplit("-", 1)[1])
 
             url = self.get_event_url(event_id, channel_id, io_port, is_proxy)
 
@@ -293,6 +351,34 @@ class ISAPIClient:
         else:
             available_events = deep_get(event_triggers, "EventTriggerList.EventTrigger", [])
 
+        # Build mapping of eventType → original ID prefix for URL construction
+        # e.g., "vmd" → "VMD", "tamperdetection" → "tamper", "thermometry" → "thermometry"
+        # This is needed because ChannelEventCapList uses different names than Event/triggers IDs
+        event_url_prefix_map = {}
+        for event_trigger in available_events:
+            event_type = event_trigger.get("eventType")
+            if isinstance(event_type, list):
+                event_type = event_type[0] if event_type else None
+            if isinstance(event_type, dict):
+                event_type = event_type.get("#text")
+            event_id_raw = event_trigger.get("id")
+            if isinstance(event_id_raw, list):
+                event_id_raw = event_id_raw[0] if event_id_raw else None
+            if isinstance(event_id_raw, dict):
+                event_id_raw = event_id_raw.get("#text")
+            if event_type and event_id_raw:
+                event_type_key = str(event_type)
+                event_id_key = str(event_id_raw)
+                # Extract prefix (e.g., "VMD-1" → "VMD", "thermometry-2" → "thermometry")
+                prefix = event_id_key.rsplit("-", 1)[0] if "-" in event_id_key else event_id_key
+                event_type_lower = event_type_key.lower()
+                event_url_prefix_map[event_type_lower] = prefix
+                # Also map the translated event ID (e.g., "vmd" → "motiondetection")
+                # so that "motiondetection" from ChannelEventCapList can find "VMD" prefix
+                translated_id = EVENTS_ALTERNATE_ID.get(event_type_lower) or EVENTS_ALTERNATE_ID.get(event_type_key)
+                if translated_id and translated_id not in event_url_prefix_map:
+                    event_url_prefix_map[translated_id] = prefix
+
         for event_trigger in available_events:
             if event := create_event_info(event_trigger):
                 events.append(event)
@@ -307,23 +393,45 @@ class ISAPIClient:
                     events.append(event)
 
         # multichannel camera needs to fetch events for each channel
-        if self.capabilities.is_multi_channel:
+        if self.capabilities.is_multi_channel or not event_triggers:
             channels_capabilities = await self.request(GET, "Event/channels/capabilities")
             channel_events = deep_get(channels_capabilities, "ChannelEventCapList.ChannelEventCap", [])
             for event_cap in channel_events:
                 event_types = deep_get(event_cap, "eventType").get("@opt", "").split(",")
-                channel_id = int(event_cap.get("channelID"))
+                channel_id = clean_int(event_cap.get("channelID"))
                 for event_type in event_types:
-                    event_id = event_type.lower()
+                    original_id = event_type.lower()
+                    event_id = original_id
                     if event_id in EVENTS_ALTERNATE_ID:
                         event_id = EVENTS_ALTERNATE_ID[event_id]
                     if event_id not in EVENTS:
                         continue
+                    if event_id == EVENT_IO:
+                        continue
                     if not [e for e in events if (e.id == event_id and e.channel_id == channel_id)]:
-                        event_trigger = await self.request(GET, f"Event/triggers/{event_id}-{channel_id}")
+                        # Use the original ID prefix from Event/triggers response if available
+                        # e.g., ChannelEventCapList has "motionDetection" but camera expects "VMD-1"
+                        # Try both the original_id and the translated event_id for lookup
+                        url_prefix = event_url_prefix_map.get(original_id) or event_url_prefix_map.get(event_id, original_id)
+                        event_trigger = await self.request(GET, f"Event/triggers/{url_prefix}-{channel_id}")
                         event_trigger = deep_get(event_trigger, "EventTrigger", {})
                         if event := create_event_info(event_trigger):
                             events.append(event)
+                        elif event_id in EVENTS:
+                            # Fallback: Create event from ChannelEventCapList even if Event/triggers fails
+                            # Some cameras report capabilities but return 403 for Event/triggers/{event}-{channel}
+                            # Yet they still send notifications for these events
+                            url = self.get_event_url(event_id, channel_id, 0, False)
+                            events.append(
+                                EventInfo(
+                                    channel_id=channel_id,
+                                    io_port_id=0,
+                                    id=event_id,
+                                    url=url,
+                                    is_proxy=False,
+                                    notifications=["center"],
+                                )
+                            )
 
         return events
 
@@ -350,6 +458,9 @@ class ISAPIClient:
         elif event_type == EVENT_PIR:
             # ISAPI/WLAlarm/PIR
             url = slug
+        elif event_type == EVENT_THERMAL:
+            # ISAPI/Thermal/channels/{channel_id}/thermometry/basicParam
+            url = f"Thermal/channels/{channel_id}/{slug}"
         else:
             url = f"Smart/{slug}/{channel_id}"
         return url
@@ -489,7 +600,7 @@ class ISAPIClient:
 
         data = {"function": event_id, "channelID": int(channel_id)}
         url = "System/mutexFunction?format=json"
-        response = await self.request(POST, url, present="json", data=json.dumps(data))
+        response = await self.request(POST, url, present="json", data=json.dumps(data), use_forbidden_cache=False)
         if not response:
             return []
         response = json.loads(response)
@@ -519,7 +630,7 @@ class ISAPIClient:
             mutex_issues = await self.get_event_switch_mutex(event, channel_id)
 
         if not mutex_issues:
-            data = await self.request(GET, event.url)
+            data = await self.request(GET, event.url, use_forbidden_cache=False)
             node = self._get_event_state_node(event)
             new_state = bool_to_str(is_enabled)
             if new_state == data[node]["enabled"]:
@@ -542,7 +653,7 @@ class ISAPIClient:
                         size = len(regions) if isinstance(regions, list) else (1 if regions else 0)
                         region_list["@size"] = str(size)
             xml = xmltodict.unparse(data)
-            await self.request(PUT, event.url, present="xml", data=xml)
+            await self.request(PUT, event.url, present="xml", data=xml, use_forbidden_cache=False)
         else:
             raise ISAPISetEventStateMutexError(event, mutex_issues)
 
@@ -563,7 +674,7 @@ class ISAPIClient:
             data["IOPortData"] = {"outputState": "low"}
 
         xml = xmltodict.unparse(data)
-        await self.request(PUT, f"System/IO/outputs/{port_no}/trigger", present="xml", data=xml)
+        await self.request(PUT, f"System/IO/outputs/{port_no}/trigger", present="xml", data=xml, use_forbidden_cache=False)
 
     async def get_holiday_enabled_state(self, holiday_index=0) -> bool:
         """Get holiday state."""
@@ -575,7 +686,7 @@ class ISAPIClient:
     async def set_holiday_enabled_state(self, is_enabled: bool, holiday_index=0) -> None:
         """Enable or disable holiday, by enable set time span to year starting from today."""
 
-        data = await self.request(GET, "System/Holidays")
+        data = await self.request(GET, "System/Holidays", use_forbidden_cache=False)
         holiday = data["HolidayList"]["holiday"][holiday_index]
         new_state = bool_to_str(is_enabled)
         if new_state == holiday["enabled"]["#text"]:
@@ -591,7 +702,7 @@ class ISAPIClient:
             holiday.pop("holidayWeek", None)
             holiday.pop("holidayMonth", None)
         xml = xmltodict.unparse(data)
-        await self.request(PUT, "System/Holidays", present="xml", data=xml)
+        await self.request(PUT, "System/Holidays", present="xml", data=xml, use_forbidden_cache=False)
 
     def _get_event_notification_host(self, data: Node) -> Node:
         hosts = deep_get(data, "HttpHostNotificationList.HttpHostNotification", [])
@@ -618,7 +729,7 @@ class ISAPIClient:
         """Set event notifications listener server."""
 
         address = urlparse(base_url)
-        data = await self.request(GET, "Event/notification/httpHosts")
+        data = await self.request(GET, "Event/notification/httpHosts", use_forbidden_cache=False)
         if not data:
             return
         host = self._get_event_notification_host(data)
@@ -659,11 +770,11 @@ class ISAPIClient:
         host["httpAuthenticationMethod"] = "none"
 
         xml = xmltodict.unparse(data)
-        await self.request(PUT, "Event/notification/httpHosts", present="xml", data=xml)
+        await self.request(PUT, "Event/notification/httpHosts", present="xml", data=xml, use_forbidden_cache=False)
 
     async def reboot(self):
         """Reboot device."""
-        await self.request(PUT, "System/reboot", present="xml")
+        await self.request(PUT, "System/reboot", present="xml", use_forbidden_cache=False)
 
     @staticmethod
     def parse_event_notification(xml: str) -> AlertInfo:
@@ -695,6 +806,8 @@ class ISAPIClient:
         detection_target = deep_get(alert, "DetectionRegionList.DetectionRegionEntry.detectionTarget")
         region_id = int(deep_get(alert, "DetectionRegionList.DetectionRegionEntry.regionID", 0))
 
+        target_type = alert.get("targetType")
+
         if not EVENTS[event_id]:
             raise ValueError(f"Unsupported event {event_id}")
 
@@ -706,6 +819,7 @@ class ISAPIClient:
             mac,
             region_id,
             detection_target,
+            target_type,
         )
 
     async def get_camera_image(
@@ -784,9 +898,14 @@ class ISAPIClient:
         url: str,
         present: str = "dict",
         data: str = None,
+        *,
+        use_forbidden_cache: bool = True,
     ) -> Any:
         """Send ISAPI request and log response, returns {} if request fails."""
         full_url = self.get_isapi_url(url)
+        cache_key = f"{method} {full_url}"
+        if use_forbidden_cache and not self.pending_initialization and cache_key in self._forbidden_cache:
+            raise ISAPIForbiddenError(url=full_url, method=method, suppressed=True)
         try:
             if not self._auth_method:
                 await self._detect_auth_method()
@@ -799,6 +918,7 @@ class ISAPIClient:
                 timeout=self.timeout,
             )
             response.raise_for_status()
+            self._forbidden_cache.discard(cache_key)
             result = parse_isapi_response(response, present)
             _LOGGER.debug("--- [%s] %s", method, full_url)
             if data:
@@ -809,6 +929,7 @@ class ISAPIClient:
             if ex.response.status_code == HTTPStatus.UNAUTHORIZED:
                 raise ISAPIUnauthorizedError(ex) from ex
             if ex.response.status_code == HTTPStatus.FORBIDDEN and not self.pending_initialization:
+                self._forbidden_cache.add(cache_key)
                 raise ISAPIForbiddenError(ex) from ex
             if self.pending_initialization:
                 # supress http errors during initialization
@@ -860,8 +981,22 @@ class ISAPIUnauthorizedError(Exception):
 class ISAPIForbiddenError(Exception):
     """HTTP Error 403."""
 
-    def __init__(self, ex: HTTPStatusError, *args) -> None:
+    def __init__(
+        self,
+        ex: HTTPStatusError | None = None,
+        *args,
+        url: str | None = None,
+        method: str = GET,
+        suppressed: bool = False,
+    ) -> None:
         """Initialize exception."""
-        self.message = f"Forbidden request {ex.request.url}, check user permissions."
-        self.response = ex.response
-        _LOGGER.warning(self.message)
+        self.suppressed = suppressed
+        if ex:
+            self.url = str(ex.request.url)
+            self.response = ex.response
+        else:
+            self.url = url or ""
+            request = httpx.Request(method, self.url) if self.url else None
+            self.response = httpx.Response(HTTPStatus.FORBIDDEN, request=request)
+        self.message = f"Forbidden request {self.url}, check user permissions."
+        super().__init__(self.message)
